@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -117,20 +118,58 @@ func main() {
 	// List Tattoos
 	r.GET("/tattoos", func(c *gin.Context) {
 		categoryFilter := c.Query("category")
-		var query string
+		pageStr := c.DefaultQuery("page", "1")
+		limitStr := c.DefaultQuery("limit", "10")
+
+		page, err := strconv.Atoi(pageStr)
+		if err != nil || page < 1 {
+			page = 1
+		}
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil || limit < 1 {
+			limit = 10
+		}
+
+		var countQuery string
 		var args []interface{}
 
 		if categoryFilter != "" {
-			query = `SELECT t.id, t.name, c.name, t.image_url, t.metadata, t.is_custom 
-				FROM tattoos t JOIN categories c ON t.category_id = c.id 
-				WHERE c.name = $1`
+			countQuery = `SELECT COUNT(*) FROM tattoos t JOIN categories c ON t.category_id = c.id WHERE c.name = $1`
 			args = append(args, categoryFilter)
 		} else {
-			query = `SELECT t.id, t.name, c.name, t.image_url, t.metadata, t.is_custom 
-				FROM tattoos t JOIN categories c ON t.category_id = c.id`
+			countQuery = `SELECT COUNT(*) FROM tattoos t JOIN categories c ON t.category_id = c.id`
 		}
 
-		rows, err := db.Query(query, args...)
+		var totalItems int
+		err = db.QueryRow(countQuery, args...).Scan(&totalItems)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		totalPages := 0
+		if limit > 0 {
+			totalPages = (totalItems + limit - 1) / limit
+		}
+
+		offset := (page - 1) * limit
+
+		var query string
+		var queryArgs []interface{}
+		if categoryFilter != "" {
+			query = `SELECT t.id, t.name, c.name, t.image_url, t.metadata, t.is_custom 
+				FROM tattoos t JOIN categories c ON t.category_id = c.id 
+				WHERE c.name = $1 
+				ORDER BY t.id LIMIT $2 OFFSET $3`
+			queryArgs = append(queryArgs, categoryFilter, limit, offset)
+		} else {
+			query = `SELECT t.id, t.name, c.name, t.image_url, t.metadata, t.is_custom 
+				FROM tattoos t JOIN categories c ON t.category_id = c.id 
+				ORDER BY t.id LIMIT $1 OFFSET $2`
+			queryArgs = append(queryArgs, limit, offset)
+		}
+
+		rows, err := db.Query(query, queryArgs...)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -148,7 +187,16 @@ func main() {
 			importJSON(metadata, &td.Metadata)
 			tattoos = append(tattoos, td)
 		}
-		c.JSON(http.StatusOK, gin.H{"data": tattoos})
+
+		c.JSON(http.StatusOK, gin.H{
+			"data": tattoos,
+			"pagination": gin.H{
+				"page":        page,
+				"limit":       limit,
+				"total_items": totalItems,
+				"total_pages": totalPages,
+			},
+		})
 	})
 
 	// Single Tattoo
