@@ -53,6 +53,14 @@ func initDB() {
 		log.Fatal("Cannot connect to database: ", err)
 	}
 	fmt.Println("Connected to PostgreSQL successfully")
+
+	// Initialize admin auth tables
+	if err := initAdminTable(); err != nil {
+		log.Fatal("Failed to init admin table: ", err)
+	}
+	if err := seedDefaultAdmin(); err != nil {
+		log.Fatal("Failed to seed admin user: ", err)
+	}
 }
 
 func initR2() {
@@ -218,99 +226,99 @@ func main() {
 		c.JSON(http.StatusOK, td)
 	})
 
-	// --- ADMIN ENDPOINTS ---
+	// --- ADMIN AUTH ---
+	r.POST("/admin/auth/login", handleLogin)
+	r.POST("/admin/auth/logout", AuthMiddleware(), handleLogout)
+	r.GET("/admin/auth/me", AuthMiddleware(), handleMe)
 
-	// Upload Tattoo
-	r.POST("/admin/tattoos/upload", func(c *gin.Context) {
-		// 1. Auth check
-		apiKey := c.GetHeader("X-Admin-API-Key")
-		if apiKey == "" || apiKey != os.Getenv("ADMIN_API_KEY") {
-			c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "message": "Invalid or missing API Key"})
-			return
-		}
-
-		// 2. Parse form
-		file, header, err := c.Request.FormFile("file")
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "File is required"})
-			return
-		}
-		defer file.Close()
-
-		name := c.PostForm("name")
-		category := c.PostForm("category")
-		metadataStr := c.PostForm("metadata")
-
-		if name == "" || category == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Name and category are required"})
-			return
-		}
-
-		// 3. Generate ID and Path
-		designID := fmt.Sprintf("%s_%d_%s", category, time.Now().UnixNano(), randStringRunes(6))
-		extension := filepath.Ext(header.Filename)
-		r2Path := fmt.Sprintf("tattoos/%s/%s%s", category, designID, extension)
-
-		// 4. Upload to R2
-		_, err = uploader.Upload(&s3manager.UploadInput{
-			Bucket: aws.String(os.Getenv("R2_BUCKET_NAME")),
-			Key:    aws.String(r2Path),
-			Body:   file,
-			ContentType: aws.String("image/png"),
-		})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Upload to R2 failed: " + err.Error()})
-			return
-		}
-
-		// 5. Get the public URL
-		publicURL := fmt.Sprintf("%s/%s", os.Getenv("CDN_DOMAIN"), r2Path)
-
-		// 6. Save to DB
-		var metadataJSON []byte
-		if metadataStr != "" {
-			var metadata map[string]interface{}
-			if err := json.Unmarshal([]byte(metadataStr), &metadata); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Invalid metadata JSON: " + err.Error()})
-				return
-			}
-			metadataJSON, err = json.Marshal(metadata)
+	// --- ADMIN PROTECTED ENDPOINTS (JWT or API key) ---
+	admin := r.Group("/admin")
+	admin.Use(AuthMiddleware())
+	{
+		// Upload Tattoo
+		admin.POST("/tattoos/upload", func(c *gin.Context) {
+			// 1. Parse form
+			file, header, err := c.Request.FormFile("file")
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Metadata serialization failed: " + err.Error()})
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "File is required"})
 				return
 			}
-		}
+			defer file.Close()
 
-		// Find category ID
-		var categoryID int
-		err = db.QueryRow("SELECT id FROM categories WHERE name = $1", category).Scan(&categoryID)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Category not found in DB"})
-			return
-		}
+			name := c.PostForm("name")
+			category := c.PostForm("category")
+			metadataStr := c.PostForm("metadata")
 
-		_, err = db.Exec("INSERT INTO tattoos (id, name, category_id, image_url, metadata) VALUES ($1, $2, $3, $4, $5)",
-			designID, name, categoryID, publicURL, metadataJSON)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "DB update failed: " + err.Error()})
-			return
-		}
+			if name == "" || category == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Name and category are required"})
+				return
+			}
 
-		c.JSON(http.StatusCreated, gin.H{
-			"status": "success",
-			"data": gin.H{
-				"id": designID,
-				"name": name,
-				"category": category,
-				"image_url": publicURL,
-				"created_at": "now",
-			},
+			// Generate ID and Path
+			designID := fmt.Sprintf("%s_%d_%s", category, time.Now().UnixNano(), randStringRunes(6))
+			extension := filepath.Ext(header.Filename)
+			r2Path := fmt.Sprintf("tattoos/%s/%s%s", category, designID, extension)
+
+			// Upload to R2
+			_, err = uploader.Upload(&s3manager.UploadInput{
+				Bucket:      aws.String(os.Getenv("R2_BUCKET_NAME")),
+				Key:         aws.String(r2Path),
+				Body:        file,
+				ContentType: aws.String("image/png"),
+			})
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Upload to R2 failed: " + err.Error()})
+				return
+			}
+
+			// Get the public URL
+			publicURL := fmt.Sprintf("%s/%s", os.Getenv("CDN_DOMAIN"), r2Path)
+
+			// Save to DB
+			var metadataJSON []byte
+			if metadataStr != "" {
+				var metadata map[string]interface{}
+				if err := json.Unmarshal([]byte(metadataStr), &metadata); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Invalid metadata JSON: " + err.Error()})
+					return
+				}
+				metadataJSON, err = json.Marshal(metadata)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Metadata serialization failed: " + err.Error()})
+					return
+				}
+			}
+
+			// Find category ID
+			var categoryID int
+			err = db.QueryRow("SELECT id FROM categories WHERE name = $1", category).Scan(&categoryID)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Category not found in DB"})
+				return
+			}
+
+			_, err = db.Exec("INSERT INTO tattoos (id, name, category_id, image_url, metadata) VALUES ($1, $2, $3, $4, $5)",
+				designID, name, categoryID, publicURL, metadataJSON)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "DB update failed: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"status": "success",
+				"data": gin.H{
+					"id":         designID,
+					"name":       name,
+					"category":   category,
+					"image_url":  publicURL,
+					"created_at": "now",
+				},
+			})
 		})
-	})
+	}
 
 	r.Run(":8080")
 }
-
 func importJSON(data []byte, target *map[string]interface{}) {
 	if len(data) == 0 {
 		return
